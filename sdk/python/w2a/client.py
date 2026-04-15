@@ -21,11 +21,64 @@ W2A_HEADERS = {
 }
 
 
+# Schemes we will make requests to — block file://, javascript://, ftp://, etc.
+_ALLOWED_SCHEMES = {"http", "https"}
+
+# Private/internal IP ranges to block (SSRF protection)
+_BLOCKED_HOSTS = {
+    "localhost", "0.0.0.0",  # nosec B104
+    "169.254.169.254",   # AWS/GCP/Azure metadata
+    "metadata.google.internal",
+    "169.254.170.2",     # ECS metadata
+}
+_BLOCKED_PREFIXES = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
+                     "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+                     "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+                     "172.30.", "172.31.", "192.168.", "127.", "::1", "fc00::",)
+
+
 def _normalise_url(url: str) -> str:
-    """Ensure URL has a scheme and return the origin."""
+    """
+    Normalise a URL to its HTTPS origin, validating scheme and host.
+
+    Raises ValueError for:
+    - Non-HTTP/HTTPS schemes (file://, javascript://, ftp://, etc.)
+    - Empty or missing netloc
+    - Private/internal IP addresses (SSRF protection)
+    """
     if not url.startswith("http"):
         url = "https://" + url
+
     parsed = urlparse(url)
+
+    # Validate scheme
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"Unsupported scheme '{parsed.scheme}'. "
+            f"W2A only supports http:// and https://"
+        )
+
+    # Validate netloc is present
+    netloc = parsed.netloc or parsed.path
+    if not netloc or netloc.startswith("/"):
+        raise ValueError(f"Invalid URL — could not extract hostname from: {url!r}")
+
+    # Extract hostname (strip port if present)
+    hostname = netloc.split(":")[0].lower().strip("[]")
+
+    # SSRF protection — block private/internal addresses
+    if hostname in _BLOCKED_HOSTS:
+        raise ValueError(
+            f"Request to '{hostname}' blocked — "
+            f"W2A does not allow requests to internal/private addresses"
+        )
+    for prefix in _BLOCKED_PREFIXES:
+        if hostname.startswith(prefix):
+            raise ValueError(
+                f"Request to '{hostname}' blocked — "
+                f"W2A does not allow requests to private IP ranges"
+            )
+
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
@@ -158,7 +211,11 @@ class W2AClient:
                 if resp.status != 200:
                     raise ManifestNotFound(origin)
                 try:
-                    manifest = await resp.json(content_type=None)
+                    # Limit manifest size to 512KB to prevent memory exhaustion
+                    raw = await resp.content.read(512 * 1024)
+                    if len(raw) == 512 * 1024:
+                        raise ManifestNotFound(origin)
+                    manifest = json.loads(raw)
                 except (json.JSONDecodeError, Exception):
                     raise ManifestNotFound(origin)
         except ManifestNotFound:
@@ -194,9 +251,15 @@ class W2AClient:
                         raise ManifestInvalid(origin, errors)
         except ManifestInvalid:
             raise
-        except Exception:
-            # Validation API unavailable — don't block discovery
-            pass
+        except Exception as e:
+            # Validation API unavailable — log and continue, don't block discovery
+            import warnings
+            warnings.warn(
+                f"W2A validation API unavailable ({e}). "
+                "Manifest could not be validated against the spec.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     async def call(
         self,
@@ -232,7 +295,15 @@ class W2AClient:
                 skill_id, [s.id for s in site.skills]
             )
 
-        url = f"{site.origin}{skill.path}"
+        # Validate skill path before constructing URL
+        raw_path = skill.path
+        if not raw_path.startswith("/"):
+            raise SkillCallError(skill_id, 0, f"Invalid skill path '{raw_path}' — must start with /")
+        # Block path traversal and protocol-relative URLs
+        if ".." in raw_path or raw_path.startswith("//"):
+            raise SkillCallError(skill_id, 0, f"Invalid skill path '{raw_path}' — path traversal not allowed")
+
+        url = f"{site.origin}{raw_path}"
         session = await self._get_session()
 
         req_headers = {**(headers or {})}
@@ -248,7 +319,11 @@ class W2AClient:
                 ) as resp:
                     if resp.status >= 400:
                         raise SkillCallError(skill_id, resp.status)
-                    return await resp.json(content_type=None)
+                    try:
+                        return await resp.json(content_type=None)
+                    except Exception:
+                        text = await resp.text()
+                        raise SkillCallError(skill_id, resp.status, f"Non-JSON response: {text[:200]}")
             else:
                 # Send params as JSON body
                 async with session.request(
@@ -259,7 +334,11 @@ class W2AClient:
                 ) as resp:
                     if resp.status >= 400:
                         raise SkillCallError(skill_id, resp.status)
-                    return await resp.json(content_type=None)
+                    try:
+                        return await resp.json(content_type=None)
+                    except Exception:
+                        text = await resp.text()
+                        raise SkillCallError(skill_id, resp.status, f"Non-JSON response: {text[:200]}")
 
         except SkillCallError:
             raise
